@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Black Hole</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden}
+canvas{display:block;touch-action:none;cursor:grab}
+canvas:active{cursor:grabbing}
+#hint{position:fixed;left:0;right:0;bottom:28px;text-align:center;font:12px/1 Helvetica,Arial,sans-serif;letter-spacing:.2em;text-transform:uppercase;color:#fff;opacity:.45;pointer-events:none;transition:opacity 2s}
+</style>
+<script type="importmap">
+{"imports":{
+  "three":"https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+</head>
+<body>
+<div id="hint">Drag to orbit · Scroll to zoom</div>
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+const renderer = new THREE.WebGLRenderer({ powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.25));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+document.body.appendChild(renderer.domElement);
+
+const uniforms = {
+  uRes: { value: new THREE.Vector2() },
+  uTime: { value: 0 },
+  uCamPos: { value: new THREE.Vector3() },
+  uCamMat: { value: new THREE.Matrix3() },
+  uEscape: { value: 40 },
+};
+
+const frag = /* glsl */`
+precision highp float;
+uniform vec2 uRes;
+uniform float uTime;
+uniform vec3 uCamPos;
+uniform mat3 uCamMat;
+uniform float uEscape;
+
+// Units: Schwarzschild radius = 1, so M = 0.5, photon sphere r = 1.5, ISCO r = 3.
+const float RIN = 3.0;
+const float ROUT = 15.0;
+const int STEPS = 520;
+
+float hash(vec3 p){ p = fract(p*0.3183099 + 0.1); p *= 17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+float noise(vec3 x){
+  vec3 i = floor(x), f = fract(x); f = f*f*(3.0-2.0*f);
+  return mix(mix(mix(hash(i),hash(i+vec3(1,0,0)),f.x), mix(hash(i+vec3(0,1,0)),hash(i+vec3(1,1,0)),f.x),f.y),
+             mix(mix(hash(i+vec3(0,0,1)),hash(i+vec3(1,0,1)),f.x), mix(hash(i+vec3(0,1,1)),hash(i+vec3(1,1,1)),f.x),f.y),f.z);
+}
+float fbm(vec3 p){ float s = 0.0, a = 0.5; for(int i=0;i<5;i++){ s += a*noise(p); p = p*2.03 + 11.7; a *= 0.5; } return s; }
+
+vec3 blackbody(float kelvin){
+  float t = clamp(kelvin, 1000.0, 40000.0) / 100.0;
+  vec3 c;
+  if(t <= 66.0){
+    c.r = 1.0;
+    c.g = clamp(0.39008158*log(t) - 0.63184144, 0.0, 1.0);
+    c.b = t <= 19.0 ? 0.0 : clamp(0.54320679*log(t-10.0) - 1.19625409, 0.0, 1.0);
+  } else {
+    c.r = clamp(1.29293619*pow(t-60.0, -0.1332047592), 0.0, 1.0);
+    c.g = clamp(1.12989086*pow(t-60.0, -0.0755148492), 0.0, 1.0);
+    c.b = 1.0;
+  }
+  return pow(c, vec3(2.2));
+}
+
+vec3 starLayer(vec3 d, float scale, float density, float seed){
+  vec3 p = d*scale, c = floor(p), f = fract(p);
+  float h = hash(c + seed);
+  if(h > density) return vec3(0);
+  vec3 o = vec3(hash(c+seed+1.3), hash(c+seed+2.7), hash(c+seed+4.1));
+  vec3 q = f - o;
+  float b = exp(-dot(q,q)*70.0) * pow(hash(c+seed+8.9), 6.0) * 9.0;
+  return blackbody(mix(2800.0, 14000.0, hash(c+seed+6.2))) * b;
+}
+
+vec3 sky(vec3 d){
+  vec3 n = normalize(vec3(0.35, 1.0, -0.25));
+  float b = dot(d, n);
+  float band = exp(-b*b*14.0);
+  float dust = fbm(d*7.0 + 3.0);
+  float glow = fbm(d*3.0);
+  vec3 col = vec3(0);
+  col += band * mix(vec3(0.35,0.30,0.42), vec3(0.65,0.55,0.45), glow) * 0.09 * glow * (1.0 - 0.85*smoothstep(0.42,0.62,dust));
+  col += vec3(0.04,0.05,0.09) * pow(fbm(d*2.0+9.0), 3.0) * 0.6;
+  col += starLayer(d, 180.0, 0.05 + band*0.10, 0.0);
+  col += starLayer(d, 330.0, 0.06 + band*0.20, 17.0) * 0.6;
+  col += starLayer(d, 70.0, 0.025, 41.0) * 1.8;
+  return col;
+}
+
+vec4 disk(vec3 p, vec3 dir){
+  float r = length(p.xz);
+  if(r < RIN*0.97 || r > ROUT) return vec4(0);
+
+  float omega = 0.70710678 * pow(r, -1.5);
+  float a = atan(p.z, p.x) - omega * uTime * 1.6;
+  vec2 cs = vec2(cos(a), sin(a));
+  float n1 = fbm(vec3(cs*1.6, r*0.9));
+  float n2 = fbm(vec3(cs*4.5, r*3.5) + 7.0);
+  float n3 = noise(vec3(cs*12.0, r*14.0));
+  float dens = smoothstep(0.2, 0.9, n1*0.55 + n2*0.45);
+  float lanes = 0.7 + 0.3*sin(r*7.0 + n1*7.0) * (0.6 + 0.4*n3);
+
+  // Novikov-Thorne flux shape, normalised to peak 1.
+  float x = RIN / max(r, RIN);
+  float flux = pow(x, 3.0) * (1.0 - sqrt(x)) / 0.0566;
+
+  // Orbital speed seen by a static observer, plus gravitational redshift: g = D * sqrt(1 - rs/r).
+  vec3 vdir = normalize(vec3(-p.z, 0.0, p.x));
+  float v = sqrt(0.5 / (r - 1.0));
+  float gam = inversesqrt(1.0 - v*v);
+  float g = sqrt(1.0 - 1.0/r) / (gam * (1.0 + v*dot(vdir, dir)));
+
+  float temp = 6200.0 * pow(flux, 0.25);
+  vec3 col = blackbody(temp * g);
+
+  float outer = 1.0 - smoothstep(ROUT*0.45, ROUT, r);
+  float inner = smoothstep(RIN*0.97, RIN*1.08, r);
+  float I = (flux*0.9 + 0.06) * pow(g, 4.0) * (0.3 + 1.1*dens) * lanes * outer * inner * 4.5;
+  float alpha = clamp((0.35 + 0.9*dens) * outer * inner * (0.55 + 0.45*flux), 0.0, 1.0);
+  return vec4(col * I, alpha);
+}
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy - 0.5*uRes) / uRes.y;
+  vec3 v = normalize(uCamMat * vec3(uv*0.85, -1.0));
+  vec3 p = uCamPos;
+  vec3 h = cross(p, v);
+  float h2 = dot(h, h);
+
+  vec3 col = vec3(0);
+  float trans = 1.0;
+  bool captured = false;
+
+  for(int i = 0; i < STEPS; i++){
+    float r = length(p);
+    if(r < 1.0){ captured = true; break; }
+    if(r > uEscape && dot(p, v) > 0.0) break;
+    float dt = clamp(0.055*r, 0.015, 2.5);
+
+    // Leapfrog on x'' = -1.5 h^2 x / r^5, the photon orbit equation in Schwarzschild.
+    vec3 vh = v - 0.75*h2*p/pow(r, 5.0)*dt;
+    vec3 np = p + vh*dt;
+    float nr = length(np);
+    v = vh - 0.75*h2*np/pow(nr, 5.0)*dt;
+
+    if(p.y*np.y < 0.0){
+      vec3 hit = mix(p, np, p.y/(p.y - np.y));
+      vec4 d = disk(hit, normalize(v));
+      col += trans * d.rgb * d.a;
+      trans *= 1.0 - d.a;
+      if(trans < 0.005) break;
+    }
+    p = np;
+  }
+
+  if(!captured) col += trans * sky(normalize(v));
+
+  col *= 1.0 - 0.42*dot(uv, uv);
+  col += (hash(vec3(gl_FragCoord.xy, fract(uTime)*91.0)) - 0.5) * 0.004;
+  gl_FragColor = vec4(max(col, 0.0), 1.0);
+}`;
+
+const scene = new THREE.Scene();
+const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.ShaderMaterial({
+  uniforms,
+  vertexShader: 'void main(){ gl_Position = vec4(position.xy, 0.0, 1.0); }',
+  fragmentShader: frag,
+  depthTest: false,
+  depthWrite: false,
+}));
+quad.frustumCulled = false;
+scene.add(quad);
+const cam = new THREE.Camera();
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, cam));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.9, 0.65, 0.72);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+const resize = () => {
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+  renderer.getDrawingBufferSize(uniforms.uRes.value);
+};
+addEventListener('resize', resize);
+resize();
+
+let yaw = 0.55, pitch = 0.085, dist = 24, distTarget = 24;
+let vYaw = 0, vPitch = 0, dragging = false, lastX = 0, lastY = 0;
+const canvas = renderer.domElement;
+const hint = document.getElementById('hint');
+
+canvas.addEventListener('pointerdown', e => {
+  dragging = true; lastX = e.clientX; lastY = e.clientY;
+  canvas.setPointerCapture(e.pointerId);
+  hint.style.opacity = 0;
+});
+canvas.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  vYaw = -(e.clientX - lastX) * 0.005;
+  vPitch = (e.clientY - lastY) * 0.004;
+  yaw += vYaw; pitch += vPitch;
+  lastX = e.clientX; lastY = e.clientY;
+});
+const release = () => { dragging = false; };
+canvas.addEventListener('pointerup', release);
+canvas.addEventListener('pointercancel', release);
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  distTarget = THREE.MathUtils.clamp(distTarget * Math.exp(e.deltaY * 0.001), 6, 60);
+}, { passive: false });
+setTimeout(() => { hint.style.opacity = 0; }, 5000);
+
+const m4 = new THREE.Matrix4(), up = new THREE.Vector3(0, 1, 0), origin = new THREE.Vector3();
+renderer.setAnimationLoop(t => {
+  if (!dragging) {
+    yaw += vYaw + 0.00035;
+    pitch += vPitch;
+    vYaw *= 0.94; vPitch *= 0.94;
+  }
+  pitch = THREE.MathUtils.clamp(pitch, -1.45, 1.45);
+  dist += (distTarget - dist) * 0.08;
+
+  const p = uniforms.uCamPos.value.set(
+    dist * Math.cos(pitch) * Math.sin(yaw),
+    dist * Math.sin(pitch),
+    dist * Math.cos(pitch) * Math.cos(yaw)
+  );
+  uniforms.uCamMat.value.setFromMatrix4(m4.lookAt(p, origin, up));
+  uniforms.uEscape.value = Math.max(dist * 1.15, 30);
+  uniforms.uTime.value = t / 1000;
+  composer.render();
+});
+</script>
+</body>
+</html>
